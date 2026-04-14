@@ -67,27 +67,37 @@ class CalibrationStore:
         # Keys and run_at values are ISO-8601 +10:00 strings.
         self._forecast_history: dict[str, list[dict]] = {}
 
-        # Deduplication index: set of (interval_time, forecast_run_at) tuples
-        # already present in _observations.  Rebuilt from storage on load.
-        # Prevents duplicate rows when Amber fires multiple times within
-        # the same 30-minute dispatch interval.
-        self._logged_pairs: set[tuple[str, str]] = set()
+        # Running average accumulator for actual RRP per (interval_time, forecast_run_at).
+        # Amber reports 5-minute dispatch prices; PD7DAY forecasts 30-minute trading
+        # interval averages.  We average all Amber readings within the interval so the
+        # actual_rrp stored in the observation log matches the quantity PD7DAY forecasts.
+        #
+        # Structure: {(interval_time, forecast_run_at): {"sum": float, "count": int, "obs_idx": int}}
+        # obs_idx is the index into _observations so we can update actual_rrp in-place.
+        self._actual_accum: dict[tuple[str, str], dict] = {}
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def async_load(self) -> None:
         obs_data = await self._obs_store.async_load() or {}
         self._observations = obs_data.get("observations", [])
-        # Rebuild dedup index from loaded observations
-        self._logged_pairs = {
-            (o["interval_time"], o["forecast_run_at"])
-            for o in self._observations
+        # Rebuild accumulator index from loaded observations.
+        # On restart we treat each stored observation as count=1 at its stored value
+        # (we can't recover the individual 5-min readings, but new Amber readings
+        # within the current interval will continue to be averaged in).
+        self._actual_accum = {
+            (o["interval_time"], o["forecast_run_at"]): {
+                "sum": o["actual_rrp"],
+                "count": 1,
+                "obs_idx": i,
+            }
+            for i, o in enumerate(self._observations)
             if "interval_time" in o and "forecast_run_at" in o
         }
         _LOGGER.info(
             "PD7DAY calibration: loaded %d observations from storage (%d unique pairs)",
             len(self._observations),
-            len(self._logged_pairs),
+            len(self._actual_accum),
         )
 
         coeff_data = await self._coeff_store.async_load()
@@ -179,16 +189,25 @@ class CalibrationStore:
             if horizon_h < 0 or horizon_h > MAX_HORIZON_HOURS:
                 continue
 
-            # Deduplication: skip if this (interval, forecast_run) pair already logged.
-            # Amber fires multiple times per 30-min interval; only the first counts.
             pair_key = (interval_time, fc["run_at"])
-            if pair_key in self._logged_pairs:
+
+            if pair_key in self._actual_accum:
+                # Subsequent Amber 5-min reading within same 30-min interval.
+                # Update the running average in the existing observation in-place.
+                acc = self._actual_accum[pair_key]
+                acc["sum"] += actual_rrp
+                acc["count"] += 1
+                new_avg = acc["sum"] / acc["count"]
+                self._observations[acc["obs_idx"]]["actual_rrp"] = round(new_avg, 6)
                 _LOGGER.debug(
-                    "Skipping duplicate observation for interval %s run_at %s",
-                    interval_time, fc["run_at"],
+                    "Updated actual_rrp for interval %s run_at %s: "
+                    "avg=%.4f over %d readings",
+                    interval_time, fc["run_at"], new_avg, acc["count"],
                 )
+                new_count += 1   # signal that a save is needed
                 continue
 
+            # First Amber reading for this pair — create a new observation.
             obs = {
                 "interval_time": interval_time,
                 "horizon_hours": round(horizon_h, 2),
@@ -203,8 +222,13 @@ class CalibrationStore:
                 "qni_violation_degree": fc.get("qni_violation"),
                 "is_intervention": fc.get("is_intervention", False),
             }
+            obs_idx = len(self._observations)
             self._observations.append(obs)
-            self._logged_pairs.add(pair_key)
+            self._actual_accum[pair_key] = {
+                "sum": actual_rrp,
+                "count": 1,
+                "obs_idx": obs_idx,
+            }
             new_count += 1
 
         if new_count:
