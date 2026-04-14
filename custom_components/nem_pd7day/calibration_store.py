@@ -67,14 +67,27 @@ class CalibrationStore:
         # Keys and run_at values are ISO-8601 +10:00 strings.
         self._forecast_history: dict[str, list[dict]] = {}
 
+        # Deduplication index: set of (interval_time, forecast_run_at) tuples
+        # already present in _observations.  Rebuilt from storage on load.
+        # Prevents duplicate rows when Amber fires multiple times within
+        # the same 30-minute dispatch interval.
+        self._logged_pairs: set[tuple[str, str]] = set()
+
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def async_load(self) -> None:
         obs_data = await self._obs_store.async_load() or {}
         self._observations = obs_data.get("observations", [])
+        # Rebuild dedup index from loaded observations
+        self._logged_pairs = {
+            (o["interval_time"], o["forecast_run_at"])
+            for o in self._observations
+            if "interval_time" in o and "forecast_run_at" in o
+        }
         _LOGGER.info(
-            "PD7DAY calibration: loaded %d observations from storage",
+            "PD7DAY calibration: loaded %d observations from storage (%d unique pairs)",
             len(self._observations),
+            len(self._logged_pairs),
         )
 
         coeff_data = await self._coeff_store.async_load()
@@ -166,6 +179,16 @@ class CalibrationStore:
             if horizon_h < 0 or horizon_h > MAX_HORIZON_HOURS:
                 continue
 
+            # Deduplication: skip if this (interval, forecast_run) pair already logged.
+            # Amber fires multiple times per 30-min interval; only the first counts.
+            pair_key = (interval_time, fc["run_at"])
+            if pair_key in self._logged_pairs:
+                _LOGGER.debug(
+                    "Skipping duplicate observation for interval %s run_at %s",
+                    interval_time, fc["run_at"],
+                )
+                continue
+
             obs = {
                 "interval_time": interval_time,
                 "horizon_hours": round(horizon_h, 2),
@@ -181,6 +204,7 @@ class CalibrationStore:
                 "is_intervention": fc.get("is_intervention", False),
             }
             self._observations.append(obs)
+            self._logged_pairs.add(pair_key)
             new_count += 1
 
         if new_count:
