@@ -56,6 +56,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # ── Shared calibration refit coroutine ──────────────────────────────────
+    #
+    # Defined here so it can be called both from the scheduled fetch path
+    # (_fetch_then_refit) and the periodic 24-hour timer (_refit callback).
+
+    async def _do_refit() -> None:
+        """Refit calibration models and refresh sensors."""
+        if store.observation_count < 10:
+            _LOGGER.debug(
+                "Skipping calibration refit — only %d observations (need \u2265 10)",
+                store.observation_count,
+            )
+            return
+        _LOGGER.info(
+            "PD7DAY calibration refit starting (%d observations)",
+            store.observation_count,
+        )
+        await store.async_refit()
+        _LOGGER.info(
+            "PD7DAY calibration refit complete \u2014 %d active buckets",
+            store.active_bucket_count,
+        )
+        await coordinator.async_refresh()
+
     # ── Scheduled fetches at AEMO publish times ──────────────────────────────
     #
     # We use async_track_point_in_utc_time which fires ONCE at a specific UTC
@@ -83,7 +107,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "PD7DAY scheduled fetch triggered — NEM time: %s",
                 now_nem().strftime("%Y-%m-%dT%H:%M:%S+10:00"),
             )
-            hass.async_create_task(coordinator.async_refresh())
+            async def _fetch_then_refit():
+                await coordinator.async_refresh()
+                # Refit immediately after each fetch — new obs may activate buckets
+                await _do_refit()  # hoisted above; accessible in this closure
+            hass.async_create_task(_fetch_then_refit())
             # Reschedule for tomorrow
             _schedule_fetch(hour, minute)
 
@@ -147,24 +175,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ── Periodic calibration refit (daily) ───────────────────────────────────
     @callback
     def _refit(_now=None):
-        """Refit calibration models and refresh sensors."""
-        async def _do_refit():
-            if store.observation_count < 10:
-                _LOGGER.debug(
-                    "Skipping calibration refit — only %d observations (need ≥ 10)",
-                    store.observation_count,
-                )
-                return
-            _LOGGER.info(
-                "PD7DAY calibration refit starting (%d observations)",
-                store.observation_count,
-            )
-            await store.async_refit()
-            _LOGGER.info(
-                "PD7DAY calibration refit complete — %d active buckets",
-                store.active_bucket_count,
-            )
-            await coordinator.async_refresh()
+        """Refit calibration models and refresh sensors (24-hour timer)."""
         hass.async_create_task(_do_refit())
 
     if store.observation_count >= 10 and store.calibration is None:
