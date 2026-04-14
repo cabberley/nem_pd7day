@@ -144,9 +144,10 @@ class CalibrationStore:
                 "is_intervention": is_intervention,
                 "region": region,
             }
-            # Key must be ISO string — period.time is a datetime object.
-            # current_nem_interval() returns ISO strings so keys must match.
-            key = to_nem_iso(period.time)
+            # Key must be ISO string — period.time is already an ISO string
+            # (interval START). current_nem_interval() also returns ISO strings
+            # so both sides of the lookup are consistent str keys.
+            key = period.time if isinstance(period.time, str) else to_nem_iso(period.time)
             if key not in self._forecast_history:
                 self._forecast_history[key] = []
             self._forecast_history[key].append(entry)
