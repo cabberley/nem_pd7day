@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "NEM PD7DAY Price Forecast",
+        "description": "Select one or more NEM regions to track. Forecasts are fetched at {fetch_times} NEM time (AEST) — matching AEMO's three daily publish windows.",
+        "data": {
+          "regions": "NEM Regions"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach NEMWeb. Check network/DNS and try again.",
+      "invalid_data": "NEMWeb returned a file but no PRICESOLUTION rows matched the selected region.",
+      "unknown": "Unexpected error. See the Home Assistant log for details."
+    },
+    "abort": {
+      "already_configured": "An entry for this region combination already exists."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "NEM PD7DAY Options",
+        "description": "Forecasts are fetched at {fetch_times} NEM time (AEST).",
+        "data": {
+          "regions": "NEM Regions"
+        }
+      }
+    }
+  }
+}
