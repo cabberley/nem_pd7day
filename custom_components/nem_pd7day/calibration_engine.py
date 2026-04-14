@@ -64,6 +64,16 @@ IRLS_ITER = 15        # quantile regression IRLS iterations
 IRLS_EPS = 1e-8       # weight floor to avoid division by zero
 QUANTILES = (0.1, 0.5, 0.9)   # P10, P50, P90
 
+# Sanity guard limits — buckets outside these bounds are rejected as corrupt
+# and fall back to passthrough rather than producing nonsense calibrations.
+#
+# NEM wholesale prices ($/kWh) physically cannot exceed ~$16/kWh (VOLL cap)
+# or go below ~−$1/kWh (market floor).  An OLS intercept outside ±1.0 $/kWh
+# indicates the training data is non-representative (duplicates, outliers, or
+# a mismatch between forecast and actual interval keys).
+MAX_INTERCEPT_ABS = 1.0   # |b| must be < this or bucket is rejected
+MAX_CALIBRATED_RATIO = 5.0  # |calibrated/raw| must be < this (when |raw|>0.01)
+
 # Horizon bucket boundaries in hours
 HORIZON_EDGES = [0, 6, 12, 24, 48, 96]   # last bucket is 96h+
 HORIZON_LABELS = ["h00_06", "h06_12", "h12_24", "h24_48", "h48_96", "h96plus"]
@@ -149,11 +159,48 @@ class BucketModel:
                 "calibrated_source": "passthrough",
                 "n_obs": self.ols.n,
             }
+
+        calibrated = self.ols.apply(x)
+
+        # ── Sanity guard ──────────────────────────────────────────────────────
+        # If the OLS intercept is physically implausible, or if the calibrated
+        # value is wildly different from the raw value, fall back to passthrough
+        # rather than emitting nonsense.  This protects against corrupt training
+        # data (e.g. duplicate observations, interval key mismatches).
+        if abs(self.ols.b) > MAX_INTERCEPT_ABS:
+            _LOGGER.warning(
+                "Bucket %s sanity check FAILED: intercept b=%.3f exceeds limit %.1f "
+                "— falling back to passthrough (raw=%.4f)",
+                self.bucket_key, self.ols.b, MAX_INTERCEPT_ABS, x,
+            )
+            return {
+                "calibrated": round(x, 6),
+                "p10": None, "p50": None, "p90": None,
+                "mae": None,
+                "calibrated_source": "passthrough_sanity",
+                "n_obs": self.ols.n,
+            }
+
+        if abs(x) > 0.01 and abs(calibrated / x) > MAX_CALIBRATED_RATIO:
+            _LOGGER.warning(
+                "Bucket %s sanity check FAILED: calibrated/raw ratio=%.1f exceeds limit %.1f "
+                "(raw=%.4f calibrated=%.4f) — falling back to passthrough",
+                self.bucket_key, calibrated / x, MAX_CALIBRATED_RATIO, x, calibrated,
+            )
+            return {
+                "calibrated": round(x, 6),
+                "p10": None, "p50": None, "p90": None,
+                "mae": None,
+                "calibrated_source": "passthrough_sanity",
+                "n_obs": self.ols.n,
+            }
+        # ─────────────────────────────────────────────────────────────────────
+
         p10 = self.q10.apply(x) if not self.q10.is_default else None
         p50 = self.q50.apply(x) if not self.q50.is_default else None
         p90 = self.q90.apply(x) if not self.q90.is_default else None
         return {
-            "calibrated": round(self.ols.apply(x), 6),
+            "calibrated": round(calibrated, 6),
             "p10": round(p10, 6) if p10 is not None else None,
             "p50": round(p50, 6) if p50 is not None else None,
             "p90": round(p90, 6) if p90 is not None else None,
