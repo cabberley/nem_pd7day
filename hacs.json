@@ -1,7 +1,6 @@
 {
   "name": "NEM PD7DAY Price Forecast",
-  "domain": "nem_pd7day",
-  "issue_tracker": "https://github.com/purcell-lab/nem_pd7day/issues",
+  "hacs": "2.0.1",
   "homeassistant": "2024.1.0",
   "render_readme": true,
   "zip_release": true,
