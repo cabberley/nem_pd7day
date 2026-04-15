@@ -34,6 +34,7 @@ def _load_config_flow_under_test():
     """Load config_flow with local HA stubs and return (module, const_module, restore_fn)."""
     module_names = [
         "aiohttp",
+        "voluptuous",
         "homeassistant",
         "homeassistant.config_entries",
         "homeassistant.core",
@@ -101,7 +102,35 @@ def _load_config_flow_under_test():
     ha_aiohttp_client = types.SimpleNamespace(async_get_clientsession=lambda _hass: MagicMock())
     ha_core = types.SimpleNamespace(callback=lambda f: f)
 
+    class _Required:
+        def __init__(self, key, default=None):
+            self.key = key
+            self.default = default
+
+    class _Schema:
+        def __init__(self, spec):
+            self.spec = spec
+
+        def __call__(self, data):
+            out = {}
+            payload = data or {}
+            for key_spec, validator in self.spec.items():
+                if isinstance(key_spec, _Required):
+                    key = key_spec.key
+                    value = payload.get(key, key_spec.default)
+                else:
+                    key = key_spec
+                    value = payload.get(key)
+
+                if callable(validator):
+                    value = validator(value)
+                out[key] = value
+            return out
+
+    vol_mod = types.SimpleNamespace(Required=_Required, Schema=_Schema)
+
     sys.modules["aiohttp"] = types.SimpleNamespace(ClientError=Exception)
+    sys.modules["voluptuous"] = vol_mod
     sys.modules["homeassistant"] = types.SimpleNamespace(config_entries=ha_config_entries)
     sys.modules["homeassistant.config_entries"] = ha_config_entries
     sys.modules["homeassistant.core"] = ha_core

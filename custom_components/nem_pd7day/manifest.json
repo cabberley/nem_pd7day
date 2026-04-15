@@ -4,7 +4,7 @@
   "codeowners": ["@purcell-lab"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/purcell-lab/nem_pd7day",
+  "documentation":"https://github.com/purcell-lab/nem_pd7day",
   "homekit": {},
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/purcell-lab/nem_pd7day/issues",
