@@ -23,7 +23,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import re
 import zipfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -32,15 +31,31 @@ from urllib.parse import urljoin
 
 import aiohttp
 
-from .nem_time import interval_start, parse_nem_csv, to_nem_iso
+try:
+    from .const import FILE_PATTERN, NEMWEB_BASE_URL, QLD1_INTERCONNECTORS
+except ImportError:  # pragma: no cover - support direct spec loading in tests
+    import importlib.util
+    import os
+    import sys
+
+    _const_name = "custom_components.nem_pd7day.const"
+    if _const_name in sys.modules:
+        _const = sys.modules[_const_name]
+    else:
+        _const_path = os.path.join(os.path.dirname(__file__), "const.py")
+        _spec = importlib.util.spec_from_file_location(_const_name, _const_path)
+        if _spec is None or _spec.loader is None:
+            raise
+        _const = importlib.util.module_from_spec(_spec)
+        sys.modules[_const_name] = _const
+        _spec.loader.exec_module(_const)
+
+    FILE_PATTERN = _const.FILE_PATTERN
+    NEMWEB_BASE_URL = _const.NEMWEB_BASE_URL
+    QLD1_INTERCONNECTORS = _const.QLD1_INTERCONNECTORS
+from .nem_time import interval_start, now_nem, parse_nem_csv, to_nem_iso
 
 _LOGGER = logging.getLogger(__name__)
-
-BASE_URL = "https://www.nemweb.com.au/REPORTS/CURRENT/PD7Day/"
-FILE_PATTERN = re.compile(r"PUBLIC_PD7DAY_.*\.(ZIP|CSV)$", re.IGNORECASE)
-
-# Interconnectors that touch QLD — exposed by default
-QLD_INTERCONNECTORS = {"NSW1-QLD1", "N-Q-MNSP1"}
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +212,7 @@ class PD7DayResult:
     prices: dict[str, PD7DayData]
     market_summary: MarketSummaryData | None
     interconnectors: dict[str, InterconnectorData]
+    updated_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -392,12 +408,12 @@ class PD7DayClient:
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        base_url: str = BASE_URL,
+        base_url: str = NEMWEB_BASE_URL,
         interconnector_ids: set[str] | None = None,
     ) -> None:
         self._session = session
         self._base_url = base_url
-        self._interconnector_ids = interconnector_ids or QLD_INTERCONNECTORS
+        self._interconnector_ids = interconnector_ids or QLD1_INTERCONNECTORS
 
     async def _list_files(self) -> list[dict[str, str]]:
         async with self._session.get(
@@ -495,4 +511,5 @@ class PD7DayClient:
             prices=prices,
             market_summary=market_summary,
             interconnectors=interconnectors,
+            updated_at=to_nem_iso(now_nem()),
         )

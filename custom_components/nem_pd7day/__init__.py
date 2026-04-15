@@ -15,12 +15,48 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 
 from .calibration_store import CalibrationStore
-from .const import (
-    CONF_REGIONS,
-    COORDINATOR_KEY,
-    DOMAIN,
-    STORE_KEY,
-)
+try:
+    from .const import (
+        AMBER_ACTUAL_ENTITY,
+        CONF_AMBER_SENSOR,
+        CONF_CALIBRATION_REGION,
+        CONF_REGIONS,
+        COORDINATOR_KEY,
+        DEFAULT_CALIBRATION_REGION,
+        DEFAULT_REGIONS,
+        DOMAIN,
+        interconnectors_for_regions,
+        REFIT_INTERVAL,
+        STORE_KEY,
+    )
+except ImportError:  # pragma: no cover - support direct spec loading in tests
+    import importlib.util
+    import os
+    import sys
+
+    _const_name = "custom_components.nem_pd7day.const"
+    if _const_name in sys.modules:
+        _const = sys.modules[_const_name]
+    else:
+        _const_path = os.path.join(os.path.dirname(__file__), "const.py")
+        _spec = importlib.util.spec_from_file_location(_const_name, _const_path)
+        if _spec is None or _spec.loader is None:
+            raise
+        _const = importlib.util.module_from_spec(_spec)
+        sys.modules[_const_name] = _const
+        _spec.loader.exec_module(_const)
+
+    AMBER_ACTUAL_ENTITY = _const.AMBER_ACTUAL_ENTITY
+    CONF_AMBER_SENSOR = _const.CONF_AMBER_SENSOR
+    CONF_CALIBRATION_REGION = _const.CONF_CALIBRATION_REGION
+    CONF_REGIONS = _const.CONF_REGIONS
+    COORDINATOR_KEY = _const.COORDINATOR_KEY
+    DEFAULT_CALIBRATION_REGION = _const.DEFAULT_CALIBRATION_REGION
+    DEFAULT_REGIONS = _const.DEFAULT_REGIONS
+    DOMAIN = _const.DOMAIN
+    interconnectors_for_regions = _const.interconnectors_for_regions
+    REFIT_INTERVAL = _const.REFIT_INTERVAL
+    STORE_KEY = _const.STORE_KEY
 from .coordinator import PD7DayCoordinator
 from .nem_time import current_nem_interval, fetch_times_as_utc, now_nem
 
@@ -28,25 +64,41 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
-# Amber entity that carries the actual wholesale RRP per interval.
-AMBER_ACTUAL_ENTITY = "sensor.amber_express_amber_feed_in_price"
-
-# How often to refit calibration models
-REFIT_INTERVAL = timedelta(hours=24)
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up NEM PD7DAY from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    regions: list[str] = entry.data[CONF_REGIONS]
+    regions: list[str] = entry.options.get(
+        CONF_REGIONS,
+        entry.data.get(CONF_REGIONS, DEFAULT_REGIONS),
+    )
+    calibration_region: str = entry.options.get(
+        CONF_CALIBRATION_REGION,
+        entry.data.get(
+            CONF_CALIBRATION_REGION,
+            regions[0] if regions else DEFAULT_CALIBRATION_REGION,
+        ),
+    )
+    if calibration_region not in regions and regions:
+        calibration_region = regions[0]
+    amber_sensor_entity: str = entry.options.get(
+        CONF_AMBER_SENSOR,
+        entry.data.get(CONF_AMBER_SENSOR, AMBER_ACTUAL_ENTITY),
+    )
+    interconnector_ids = interconnectors_for_regions(regions)
 
     # ── Calibration store ────────────────────────────────────────────────────
     store = CalibrationStore(hass)
     await store.async_load()
 
     # ── Coordinator (no automatic polling) ───────────────────────────────────
-    coordinator = PD7DayCoordinator(hass, regions, store)
+    coordinator = PD7DayCoordinator(
+        hass,
+        regions,
+        store,
+        interconnector_ids=interconnector_ids,
+    )
     await coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id] = {
@@ -161,13 +213,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         interval_iso = current_nem_interval()
 
         hass.async_create_task(
-            store.async_record_actual(interval_iso, actual_rrp)
+            store.async_record_actual(
+                interval_iso,
+                actual_rrp,
+                calibration_region=calibration_region,
+            )
         )
 
     entry.async_on_unload(
         async_track_state_change_event(
             hass,
-            [AMBER_ACTUAL_ENTITY],
+            [amber_sensor_entity],
             _on_amber_state_change,
         )
     )

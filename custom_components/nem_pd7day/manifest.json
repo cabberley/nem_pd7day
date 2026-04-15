@@ -1,12 +1,16 @@
 {
   "domain": "nem_pd7day",
-  "name": "NEM PD7DAY Price Forecast",
-  "version": "1.9.0",
-  "documentation": "https://github.com/purcell-lab/nem_pd7day",
-  "issue_tracker": "https://github.com/purcell-lab/nem_pd7day/issues",
-  "requirements": [],
-  "dependencies": [],
+  "name": "AEMO NEM 7 Day Forecast",
   "codeowners": ["@purcell-lab"],
   "config_flow": true,
-  "iot_class": "cloud_polling"
+  "dependencies": [],
+  "documentation": "https://github.com/purcell-lab/nem_pd7day",
+  "homekit": {},
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/purcell-lab/nem_pd7day/issues",
+  "loggers": ["nem_pd7day"],
+  "requirements": [],
+  "ssdp": [],
+  "version": "1.9.0",
+  "zeroconf": []
 }

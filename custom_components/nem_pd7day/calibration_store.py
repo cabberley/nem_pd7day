@@ -32,20 +32,44 @@ from .calibration_engine import (
     CalibrationResult,
     Observation,
 )
+try:
+    from .const import (
+        COEFF_STORAGE_KEY,
+        MAX_FORECAST_AGE_DAYS,
+        MAX_HORIZON_HOURS,
+        MAX_TOTAL_OBS,
+        OBS_STORAGE_KEY,
+        STORAGE_VERSION,
+    )
+except ImportError:  # pragma: no cover - support direct spec loading in tests
+    import importlib.util
+    import os
+    import sys
+
+    _const_name = "custom_components.nem_pd7day.const"
+    if _const_name in sys.modules:
+        _const = sys.modules[_const_name]
+    else:
+        _const_path = os.path.join(os.path.dirname(__file__), "const.py")
+        _spec = importlib.util.spec_from_file_location(_const_name, _const_path)
+        if _spec is None or _spec.loader is None:
+            raise
+        _const = importlib.util.module_from_spec(_spec)
+        sys.modules[_const_name] = _const
+        _spec.loader.exec_module(_const)
+
+    COEFF_STORAGE_KEY = _const.COEFF_STORAGE_KEY
+    MAX_FORECAST_AGE_DAYS = _const.MAX_FORECAST_AGE_DAYS
+    MAX_HORIZON_HOURS = _const.MAX_HORIZON_HOURS
+    MAX_TOTAL_OBS = _const.MAX_TOTAL_OBS
+    OBS_STORAGE_KEY = _const.OBS_STORAGE_KEY
+    STORAGE_VERSION = _const.STORAGE_VERSION
 from .nem_time import now_nem, parse_iso, to_nem_iso
 
 if TYPE_CHECKING:
     from .pd7day_client import PD7DayData, InterconnectorData, CaseSolutionData
 
 _LOGGER = logging.getLogger(__name__)
-
-OBS_STORAGE_KEY = "nem_pd7day.observation_log"
-COEFF_STORAGE_KEY = "nem_pd7day.calibration_coefficients"
-STORAGE_VERSION = 1
-
-MAX_TOTAL_OBS = 20_000
-MAX_FORECAST_AGE_DAYS = 14
-MAX_HORIZON_HOURS = 168   # 7 days
 
 
 class CalibrationStore:
@@ -175,6 +199,7 @@ class CalibrationStore:
         self,
         interval_time: str,   # ISO-8601 +10:00 NEM time
         actual_rrp: float,
+        calibration_region: str | None = None,
     ) -> int:
         """
         Match the actual RRP for an interval against all PD7DAY forecasts
@@ -192,6 +217,9 @@ class CalibrationStore:
         new_count = 0
 
         for fc in forecasts:
+            if calibration_region and fc.get("region") != calibration_region:
+                continue
+
             try:
                 run_dt = parse_iso(fc["run_at"])
             except (ValueError, KeyError):

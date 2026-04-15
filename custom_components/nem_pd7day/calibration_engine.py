@@ -52,39 +52,49 @@ import math
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+try:
+    from .const import (
+        HORIZON_EDGES,
+        HORIZON_LABELS,
+        IRLS_EPS,
+        IRLS_ITER,
+        MAX_CALIBRATED_RATIO,
+        MAX_INTERCEPT_ABS,
+        MAX_OBS,
+        MIN_OBS,
+        QUANTILES,
+        TOD_BUCKETS,
+    )
+except ImportError:  # pragma: no cover - support direct spec loading in tests
+    import importlib.util
+    import os
+    import sys
+
+    _const_name = "custom_components.nem_pd7day.const"
+    if _const_name in sys.modules:
+        _const = sys.modules[_const_name]
+    else:
+        _const_path = os.path.join(os.path.dirname(__file__), "const.py")
+        _spec = importlib.util.spec_from_file_location(_const_name, _const_path)
+        if _spec is None or _spec.loader is None:
+            raise
+        _const = importlib.util.module_from_spec(_spec)
+        sys.modules[_const_name] = _const
+        _spec.loader.exec_module(_const)
+
+    HORIZON_EDGES = _const.HORIZON_EDGES
+    HORIZON_LABELS = _const.HORIZON_LABELS
+    IRLS_EPS = _const.IRLS_EPS
+    IRLS_ITER = _const.IRLS_ITER
+    MAX_CALIBRATED_RATIO = _const.MAX_CALIBRATED_RATIO
+    MAX_INTERCEPT_ABS = _const.MAX_INTERCEPT_ABS
+    MAX_OBS = _const.MAX_OBS
+    MIN_OBS = _const.MIN_OBS
+    QUANTILES = _const.QUANTILES
+    TOD_BUCKETS = _const.TOD_BUCKETS
 from .nem_time import now_nem, to_nem_iso
 
 _LOGGER = logging.getLogger(__name__)
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-MIN_OBS = 10          # minimum observations before a bucket is used
-MAX_OBS = 5000        # cap stored observations per bucket (rolling window)
-IRLS_ITER = 15        # quantile regression IRLS iterations
-IRLS_EPS = 1e-8       # weight floor to avoid division by zero
-QUANTILES = (0.1, 0.5, 0.9)   # P10, P50, P90
-
-# Sanity guard limits — buckets outside these bounds are rejected as corrupt
-# and fall back to passthrough rather than producing nonsense calibrations.
-#
-# NEM wholesale prices ($/kWh) physically cannot exceed ~$16/kWh (VOLL cap)
-# or go below ~−$1/kWh (market floor).  An OLS intercept outside ±1.0 $/kWh
-# indicates the training data is non-representative (duplicates, outliers, or
-# a mismatch between forecast and actual interval keys).
-MAX_INTERCEPT_ABS = 1.0   # |b| must be < this or bucket is rejected
-MAX_CALIBRATED_RATIO = 5.0  # |calibrated/raw| must be < this (when |raw|>0.01)
-
-# Horizon bucket boundaries in hours
-HORIZON_EDGES = [0, 6, 12, 24, 48, 96]   # last bucket is 96h+
-HORIZON_LABELS = ["h00_06", "h06_12", "h12_24", "h24_48", "h48_96", "h96plus"]
-
-# Time-of-day buckets (QLD local time, hour ranges are half-open [a, b))
-TOD_BUCKETS = {
-    "solar":    (10, 16),   # solar oversupply window — negative price risk
-    "peak":     (16, 20),   # demand peak — spike risk
-    "shoulder": (20, 22),   # transition
-    "offpeak":  None,       # everything else
-}
 
 
 # ── Data structures ───────────────────────────────────────────────────────────

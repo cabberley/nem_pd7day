@@ -9,8 +9,29 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN
-from .pd7day_client import PD7DayClient, PD7DayResult, QLD_INTERCONNECTORS
+try:
+    from .const import DOMAIN, QLD1_INTERCONNECTORS, interconnectors_for_regions
+except ImportError:  # pragma: no cover - support direct spec loading in tests
+    import importlib.util
+    import os
+    import sys
+
+    _const_name = "custom_components.nem_pd7day.const"
+    if _const_name in sys.modules:
+        _const = sys.modules[_const_name]
+    else:
+        _const_path = os.path.join(os.path.dirname(__file__), "const.py")
+        _spec = importlib.util.spec_from_file_location(_const_name, _const_path)
+        if _spec is None or _spec.loader is None:
+            raise
+        _const = importlib.util.module_from_spec(_spec)
+        sys.modules[_const_name] = _const
+        _spec.loader.exec_module(_const)
+
+    DOMAIN = _const.DOMAIN
+    QLD1_INTERCONNECTORS = _const.QLD1_INTERCONNECTORS
+    interconnectors_for_regions = _const.interconnectors_for_regions
+from .pd7day_client import PD7DayClient, PD7DayResult
 
 if TYPE_CHECKING:
     from .calibration_store import CalibrationStore
@@ -45,7 +66,8 @@ class PD7DayCoordinator(DataUpdateCoordinator[PD7DayResult]):
             update_interval=None,   # no automatic polling — time-triggered only
         )
         self._regions = regions
-        self._interconnector_ids = interconnector_ids or QLD_INTERCONNECTORS
+        derived_ids = interconnectors_for_regions(regions)
+        self._interconnector_ids = interconnector_ids or derived_ids or QLD1_INTERCONNECTORS
         self._store = store
         self._session: aiohttp.ClientSession | None = None
 
