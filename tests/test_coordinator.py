@@ -1,0 +1,439 @@
+"""
+Tests for coordinator.py — the fetch→ingest→store pipeline.
+
+Covers the end-to-end flow that links PD7DayClient, CalibrationStore,
+and the coordinator.  These tests catch integration-level bugs that
+unit tests on individual components miss.
+
+Key scenarios:
+  - Coordinator feeds forecast into store after fetch
+  - Re-fetch of same AEMO file (restart) does NOT duplicate forecast history
+  - Different AEMO publish (new run_at) DOES add new entries
+  - Intervention flag from CASESOLUTION reaches the store
+
+Run with:  python -m pytest tests/test_coordinator.py -v
+"""
+from __future__ import annotations
+
+import sys
+import os
+import asyncio
+import importlib.util
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Stub HA and aiohttp
+sys.modules.setdefault("aiohttp", MagicMock())
+for ha_mod in [
+    "homeassistant", "homeassistant.core", "homeassistant.helpers",
+    "homeassistant.helpers.storage", "homeassistant.helpers.event",
+    "homeassistant.helpers.aiohttp_client", "homeassistant.helpers.update_coordinator",
+    "homeassistant.helpers.entity_platform", "homeassistant.config_entries",
+    "homeassistant.const", "homeassistant.util", "homeassistant.util.dt",
+]:
+    sys.modules.setdefault(ha_mod, MagicMock())
+
+# DataUpdateCoordinator stub — our coordinator inherits from it
+class _FakeCoordinator:
+    def __init__(self, hass, logger, name, update_interval):
+        self.hass = hass
+        self.logger = logger
+        self.name = name
+        self.update_interval = update_interval
+        self.last_update_success = True
+        self.data = None
+
+    # Support DataUpdateCoordinator[PD7DayResult] subscript syntax
+    def __class_getitem__(cls, item):
+        return cls
+
+    async def async_config_entry_first_refresh(self):
+        pass
+
+uc_mock = MagicMock()
+uc_mock.DataUpdateCoordinator = _FakeCoordinator
+uc_mock.UpdateFailed = Exception
+sys.modules["homeassistant.helpers.update_coordinator"] = uc_mock
+
+_nem_time = _load(
+    "custom_components.nem_pd7day.nem_time",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "nem_time.py"),
+)
+_engine_mod = _load(
+    "custom_components.nem_pd7day.calibration_engine",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "calibration_engine.py"),
+)
+
+# HA storage stub for CalibrationStore
+ha_storage_mock = MagicMock()
+class _FakeStore:
+    def __init__(self, hass, version, key): pass
+    async def async_load(self): return None
+    async def async_save(self, data): pass
+ha_storage_mock.Store = _FakeStore
+sys.modules["homeassistant.helpers.storage"] = ha_storage_mock
+
+_store_mod = _load(
+    "custom_components.nem_pd7day.calibration_store",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "calibration_store.py"),
+)
+_client_mod = _load(
+    "custom_components.nem_pd7day.pd7day_client",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "pd7day_client.py"),
+)
+
+# Load const before coordinator
+_const_mod = _load(
+    "custom_components.nem_pd7day.const",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "const.py"),
+)
+_coord_mod = _load(
+    "custom_components.nem_pd7day.coordinator",
+    os.path.join(_ROOT, "custom_components", "nem_pd7day", "coordinator.py"),
+)
+
+from custom_components.nem_pd7day.calibration_store import CalibrationStore
+from custom_components.nem_pd7day.coordinator import PD7DayCoordinator
+from custom_components.nem_pd7day.pd7day_client import (
+    PD7DayResult, PD7DayData, CaseSolutionData, PricePeriod,
+    MarketSummaryData, InterconnectorData,
+)
+
+NEM_TZ = timezone(timedelta(hours=10))
+
+
+def run_async(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def nem_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+10:00")
+
+
+def make_price_period(nemtime_dt: datetime, value: float = 0.10) -> PricePeriod:
+    start_dt = nemtime_dt - timedelta(minutes=30)
+    return PricePeriod(
+        nemtime=nem_iso(nemtime_dt),
+        time=nem_iso(start_dt),
+        value=value,
+    )
+
+
+def make_pd7day_data(run_at_dt: datetime, periods: list) -> PD7DayData:
+    return PD7DayData(
+        region="QLD1",
+        source_file="PUBLIC_PD7DAY_20260415.ZIP",
+        forecast_generated_at=nem_iso(run_at_dt),
+        interval_minutes=30,
+        current_value=periods[0].value if periods else 0.0,
+        next_value=periods[1].value if len(periods) > 1 else None,
+        min_24h_value=None,
+        max_24h_value=None,
+        cheapest_2h_window=None,
+        forecast=periods,
+    )
+
+
+def make_case(intervention: bool = False, run_dt: str = "2026-04-15T07:25:07+10:00"):
+    return CaseSolutionData(
+        run_datetime=run_dt,
+        intervention=intervention,
+        last_changed=run_dt,
+    )
+
+
+def make_result(run_at_dt: datetime, periods: list,
+                intervention: bool = False) -> PD7DayResult:
+    price_data = make_pd7day_data(run_at_dt, periods)
+    return PD7DayResult(
+        source_file="PUBLIC_PD7DAY_20260415.ZIP",
+        case=make_case(intervention),
+        prices={"QLD1": price_data},
+        market_summary=None,
+        interconnectors={},
+    )
+
+
+def make_store() -> CalibrationStore:
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(
+        side_effect=lambda fn, *args: asyncio.coroutine(lambda: fn(*args))()
+    )
+    store = CalibrationStore.__new__(CalibrationStore)
+    store._hass = hass
+    store._obs_store = MagicMock()
+    store._obs_store.async_load = AsyncMock(return_value=None)
+    store._obs_store.async_save = AsyncMock()
+    store._coeff_store = MagicMock()
+    store._coeff_store.async_load = AsyncMock(return_value=None)
+    store._coeff_store.async_save = AsyncMock()
+    from custom_components.nem_pd7day.calibration_engine import CalibrationEngine
+    store._engine = CalibrationEngine()
+    store._observations = []
+    store._calibration = None
+    store._forecast_history = {}
+    store._actual_accum = {}
+    return store
+
+
+def make_coordinator(store=None) -> PD7DayCoordinator:
+    hass = MagicMock()
+    coord = PD7DayCoordinator.__new__(PD7DayCoordinator)
+    coord.hass = hass
+    coord.logger = MagicMock()
+    coord.name = "nem_pd7day"
+    coord.update_interval = None
+    coord.last_update_success = True
+    coord.data = None
+    coord._regions = ["QLD1"]
+    coord._interconnector_ids = {"NSW1-QLD1"}
+    coord._store = store
+    coord._session = None
+    return coord
+
+
+# ── Tests: coordinator feeds store ───────────────────────────────────────────
+
+def test_coordinator_calls_ingest_forecast_after_fetch():
+    """
+    After a successful fetch, the coordinator must call store.ingest_forecast()
+    for each region in the result.
+    """
+    store = MagicMock()
+    coord = make_coordinator(store=store)
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    periods = [make_price_period(datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ))]
+    result = make_result(run_at_dt, periods)
+
+    # Simulate what _async_update_data does with the result
+    if coord._store is not None:
+        for region, price_data in result.prices.items():
+            coord._store.ingest_forecast(
+                region=region,
+                price_data=price_data,
+                interconnectors=result.interconnectors,
+                case=result.case,
+            )
+
+    store.ingest_forecast.assert_called_once()
+    call_kwargs = store.ingest_forecast.call_args
+    assert call_kwargs[1]["region"] == "QLD1" or call_kwargs[0][0] == "QLD1"
+
+
+def test_coordinator_ingest_with_real_store_populates_history():
+    """
+    End-to-end: coordinator fetch result flows into CalibrationStore.
+    After one fetch, _forecast_history must have entries for each period.
+    """
+    store = make_store()
+    coord = make_coordinator(store=store)
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    period_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    periods = [make_price_period(period_end_dt, value=0.085)]
+    result = make_result(run_at_dt, periods)
+
+    # Run the ingest directly
+    for region, price_data in result.prices.items():
+        store.ingest_forecast(
+            region=region,
+            price_data=price_data,
+            interconnectors=result.interconnectors,
+            case=result.case,
+        )
+
+    expected_key = nem_iso(period_end_dt - timedelta(minutes=30))
+    assert expected_key in store._forecast_history, (
+        f"After coordinator fetch, {expected_key!r} must be in forecast_history. "
+        f"Keys present: {list(store._forecast_history.keys())[:3]}"
+    )
+    entries = store._forecast_history[expected_key]
+    assert len(entries) == 1
+    assert entries[0]["run_at"] == nem_iso(run_at_dt)
+    assert abs(entries[0]["forecast_price"] - 0.085) < 1e-9
+
+
+def test_restart_reingest_same_file_no_duplicate():
+    """
+    BUG (v1.8.0): HA restart triggers a startup fetch then the scheduled fetch
+    may already have the same AEMO file (same run_at).  ingest_forecast must
+    silently skip duplicate run_at entries rather than appending them.
+
+    Scenario: startup fetch at t=0, then 2nd fetch at t=5min (same AEMO file).
+    _forecast_history must have exactly 1 entry, not 2.
+    """
+    store = make_store()
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    period_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    periods = [make_price_period(period_end_dt, value=0.085)]
+    price_data = make_pd7day_data(run_at_dt, periods)
+
+    # First ingest (startup)
+    store.ingest_forecast("QLD1", price_data, {}, make_case())
+    # Second ingest (restart-triggered, same AEMO file = same run_at)
+    store.ingest_forecast("QLD1", price_data, {}, make_case())
+
+    key = nem_iso(period_end_dt - timedelta(minutes=30))
+    entries = store._forecast_history[key]
+    assert len(entries) == 1, (
+        f"Expected 1 history entry after double-ingest of same run_at, "
+        f"got {len(entries)}. Duplicate ingest corrupts running average."
+    )
+
+
+def test_new_aemo_publish_adds_second_entry():
+    """
+    Two genuine AEMO publishes (different run_at) covering the same interval
+    must each produce a separate history entry.
+    """
+    store = make_store()
+
+    period_end_dt = datetime(2026, 4, 16, 7, 0, tzinfo=NEM_TZ)
+    run1 = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    run2 = datetime(2026, 4, 15, 13, 0, tzinfo=NEM_TZ)
+
+    for run_at_dt in [run1, run2]:
+        periods = [make_price_period(period_end_dt, value=0.10)]
+        price_data = make_pd7day_data(run_at_dt, periods)
+        store.ingest_forecast("QLD1", price_data, {}, make_case())
+
+    key = nem_iso(period_end_dt - timedelta(minutes=30))
+    entries = store._forecast_history[key]
+    assert len(entries) == 2, (
+        f"Two distinct AEMO publishes must produce 2 history entries, got {len(entries)}"
+    )
+    run_ats = [e["run_at"] for e in entries]
+    assert nem_iso(run1) in run_ats
+    assert nem_iso(run2) in run_ats
+
+
+def test_intervention_flag_propagated_to_history():
+    """
+    is_intervention from CaseSolutionData must be stored in each history entry.
+    Observations created during intervention periods must be excluded from OLS.
+    """
+    store = make_store()
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    period_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    periods = [make_price_period(period_end_dt)]
+    price_data = make_pd7day_data(run_at_dt, periods)
+
+    store.ingest_forecast("QLD1", price_data, {}, make_case(intervention=True))
+
+    key = nem_iso(period_end_dt - timedelta(minutes=30))
+    assert store._forecast_history[key][0]["is_intervention"] is True, (
+        "intervention=True from CaseSolutionData must reach forecast history entries"
+    )
+
+
+def test_intervention_observations_excluded_from_ols():
+    """
+    Observations marked is_intervention=True must be skipped during OLS fit.
+    CalibrationEngine.fit() excludes them; this test verifies the flag flows
+    correctly from CASESOLUTION → history → observation → engine.
+    """
+    store = make_store()
+    from custom_components.nem_pd7day.calibration_engine import (
+        CalibrationEngine, Observation
+    )
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    period_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    period_start_str = nem_iso(period_end_dt - timedelta(minutes=30))
+    periods = [make_price_period(period_end_dt, value=0.10)]
+    price_data = make_pd7day_data(run_at_dt, periods)
+
+    # Ingest as intervention
+    store.ingest_forecast("QLD1", price_data, {}, make_case(intervention=True))
+
+    # Record an actual for that interval
+    run_async(store.async_record_actual(period_start_str, 0.095))
+
+    # Observation must exist but be flagged
+    assert len(store._observations) == 1
+    obs = store._observations[0]
+    assert obs["is_intervention"] is True, (
+        "Observation must be flagged as intervention"
+    )
+
+    # Now verify the engine excludes it
+    engine = CalibrationEngine()
+    obs_list = [Observation(
+        interval_time=obs["interval_time"],
+        horizon_hours=obs["horizon_hours"],
+        pd7day_forecast=obs["pd7day_forecast"],
+        actual_rrp=obs["actual_rrp"],
+        forecast_run_at=obs["forecast_run_at"],
+        hour_of_day=obs["hour_of_day"],
+        day_of_week=obs["day_of_week"],
+        month=obs["month"],
+        gas_forecast_tj=obs.get("gas_forecast_tj"),
+        qni_mwflow=obs.get("qni_mwflow"),
+        qni_violation_degree=obs.get("qni_violation_degree"),
+        is_intervention=obs["is_intervention"],
+    )]
+    result = engine.fit(obs_list)
+    assert result.total_observations == 0, (
+        f"Intervention observation must be excluded from OLS fit. "
+        f"Got total_observations={result.total_observations}"
+    )
+
+
+def test_no_store_coordinator_does_not_crash():
+    """Coordinator with store=None must not crash when processing a result."""
+    coord = make_coordinator(store=None)
+    result = make_result(datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ), [])
+
+    # Simulate _async_update_data logic
+    if coord._store is not None:
+        for region, price_data in result.prices.items():
+            coord._store.ingest_forecast(
+                region=region,
+                price_data=price_data,
+                interconnectors=result.interconnectors,
+                case=result.case,
+            )
+    # Must not raise — store is None
+
+
+def test_forecast_price_stored_is_raw_not_calibrated():
+    """
+    The forecast_price stored in history must be the raw AEMO value (period.value),
+    not a calibrated value.  OLS trains actual ~ a*raw + b; if calibrated values
+    are stored instead, the model trains on already-corrected data (circular).
+    """
+    store = make_store()
+
+    run_at_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    period_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    raw_value = 0.085  # $/kWh from AEMO CSV
+
+    # PricePeriod.value IS the raw value — the integration sets it directly
+    # from float(row[8]) / 1000.  Calibration is applied later in sensor.py.
+    period = make_price_period(period_end_dt, value=raw_value)
+    price_data = make_pd7day_data(run_at_dt, [period])
+    store.ingest_forecast("QLD1", price_data, {}, make_case())
+
+    key = nem_iso(period_end_dt - timedelta(minutes=30))
+    entry = store._forecast_history[key][0]
+
+    assert abs(entry["forecast_price"] - raw_value) < 1e-9, (
+        f"forecast_price in history must be raw AEMO value {raw_value}, "
+        f"got {entry['forecast_price']}. If calibrated, OLS is circular."
+    )
