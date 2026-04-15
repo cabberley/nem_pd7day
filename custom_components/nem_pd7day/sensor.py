@@ -192,8 +192,10 @@ class PD7DayForecastSensor(CoordinatorEntity[PD7DayCoordinator], SensorEntity):
 
     def _calibrate_period(self, period, run_at_str: str | None) -> dict:
         """Build the enriched forecast dict for one PricePeriod."""
-        # Use nemtime (interval END, AEMO reference) for horizon calculation
-        h = _horizon_hours(run_at_str, period.nemtime)
+        # Use period.time (interval START) for horizon — matches the store's
+        # horizon calculation in async_record_actual so bucket routing is
+        # consistent between training and inference.
+        h = _horizon_hours(run_at_str, period.time)
         try:
             hour = parse_iso(period.time).hour  # NEM local hour from interval START
         except (ValueError, TypeError):

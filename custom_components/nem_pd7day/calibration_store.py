@@ -135,6 +135,21 @@ class CalibrationStore:
         qni_violation = qni.current_violationdegree if qni else None
 
         for period in price_data.forecast:
+            # Key must be ISO string — period.time is already an ISO string
+            # (interval START). current_nem_interval() also returns ISO strings
+            # so both sides of the lookup are consistent str keys.
+            key = period.time if isinstance(period.time, str) else to_nem_iso(period.time)
+            if key not in self._forecast_history:
+                self._forecast_history[key] = []
+
+            # Deduplicate by (interval_time, run_at): if this forecast run was
+            # already ingested (e.g. HA restarted and refetched the same AEMO
+            # file, or startup + scheduled fetch returned identical data), skip
+            # it.  Without this guard, each Amber reading would be averaged
+            # against N duplicate run_at entries and corrupt the running average.
+            if any(e["run_at"] == run_at_str for e in self._forecast_history[key]):
+                continue
+
             entry = {
                 "run_at": run_at_str,
                 "forecast_price": period.value,
@@ -144,12 +159,6 @@ class CalibrationStore:
                 "is_intervention": is_intervention,
                 "region": region,
             }
-            # Key must be ISO string — period.time is already an ISO string
-            # (interval START). current_nem_interval() also returns ISO strings
-            # so both sides of the lookup are consistent str keys.
-            key = period.time if isinstance(period.time, str) else to_nem_iso(period.time)
-            if key not in self._forecast_history:
-                self._forecast_history[key] = []
             self._forecast_history[key].append(entry)
 
         # Prune old history — compare ISO strings directly (fixed offset sorts correctly)

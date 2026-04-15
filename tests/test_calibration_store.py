@@ -498,6 +498,106 @@ def test_multiple_forecast_runs_create_multiple_observations():
     assert horizons[0] < horizons[1], "Second run should have shorter horizon"
 
 
+# ── Tests: ingest deduplication (v1.8.0 regression) ─────────────────────────
+
+def test_reingest_same_run_at_does_not_duplicate_forecast_history():
+    """
+    BUG (v1.8.0): ingest_forecast called twice with the same run_at (e.g. HA
+    restart + refetch of same AEMO file) appended duplicate entries to
+    _forecast_history.  Each Amber reading then iterated all duplicates and
+    called async_record_actual update path multiple times, corrupting the
+    running average by counting each Amber sample N times instead of once.
+
+    After dedup fix: second ingest of same run_at must be silently ignored.
+    """
+    store = make_store()
+    run_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)  # 07:30 NEM publish
+    interval_end_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    period = make_price_period(interval_end_dt, value=0.110)
+    price_data = make_price_data(run_dt, [period])
+
+    # Ingest the same forecast twice (restart scenario)
+    store.ingest_forecast("QLD1", price_data, {}, None)
+    store.ingest_forecast("QLD1", price_data, {}, None)  # same run_at
+
+    # History must have exactly one entry per interval key
+    key = nem_iso(interval_end_dt - timedelta(minutes=30))
+    assert key in store._forecast_history
+    assert len(store._forecast_history[key]) == 1, (
+        f"Expected 1 history entry after dedup, got {len(store._forecast_history[key])}"
+    )
+
+    # Record an Amber reading — must produce exactly one observation
+    run_async(store.async_record_actual(key, 0.095))
+    assert len(store._observations) == 1, (
+        f"Duplicate forecast history caused {len(store._observations)} obs (expected 1)"
+    )
+
+
+def test_reingest_different_run_at_adds_new_entry():
+    """
+    Two genuine AEMO publish runs (different run_at timestamps) covering the
+    same interval must both be stored — they produce distinct observations
+    with different horizons.
+    """
+    store = make_store()
+    interval_end_dt = datetime(2026, 4, 15, 18, 0, tzinfo=NEM_TZ)
+    interval_start_str = nem_iso(interval_end_dt - timedelta(minutes=30))
+
+    run1_dt = datetime(2026, 4, 15, 7, 30, tzinfo=NEM_TZ)
+    run2_dt = datetime(2026, 4, 15, 13, 0, tzinfo=NEM_TZ)
+
+    for run_dt in [run1_dt, run2_dt]:
+        period = make_price_period(interval_end_dt, value=0.110)
+        store.ingest_forecast("QLD1", make_price_data(run_dt, [period]), {}, None)
+
+    assert len(store._forecast_history[interval_start_str]) == 2, (
+        "Two distinct run_at timestamps must produce two history entries"
+    )
+
+    run_async(store.async_record_actual(interval_start_str, 0.095))
+    assert len(store._observations) == 2, (
+        "Two forecast runs covering one interval must produce two observations"
+    )
+
+
+def test_horizon_uses_interval_start_not_nemtime():
+    """
+    BUG (v1.8.0): sensor._calibrate_period used period.nemtime (interval END)
+    for horizon calculation, but calibration_store.async_record_actual used
+    period.time (interval START).  The horizon stored in observations was thus
+    30 minutes shorter than the horizon used for bucket lookup — causing
+    misrouting near bucket boundaries.
+
+    This test verifies the store uses interval START (period.time) for horizon.
+    With run_at=07:30 and interval_start=14:00, horizon must be 6.5h → h06_12.
+    If nemtime (14:30) were used, horizon=7.0h → still h06_12 in this case,
+    so we use a boundary case: run_at=07:30, interval_start=13:30 (horizon=6.0h
+    → h06_12), nemtime=14:00 (horizon=6.5h → also h06_12).
+    Use a case that crosses the 6h boundary: run_at=08:00, interval_start=14:00
+    (horizon=6.0h exactly, on the boundary between h00_06 and h06_12).
+    """
+    store = make_store()
+    # run_at = 08:00 NEM; interval START = 14:00 NEM → horizon = 6.0h exactly
+    # The bucket boundary is at 6h: horizon < 6 → h00_06, horizon >= 6 → h06_12.
+    run_dt = datetime(2026, 4, 15, 8, 0, tzinfo=NEM_TZ)
+    interval_start_dt = datetime(2026, 4, 15, 14, 0, tzinfo=NEM_TZ)
+    interval_end_dt = interval_start_dt + timedelta(minutes=30)  # 14:30 NEM
+
+    period = make_price_period(interval_end_dt, value=0.12)
+    store.ingest_forecast("QLD1", make_price_data(run_dt, [period]), {}, None)
+
+    run_async(store.async_record_actual(nem_iso(interval_start_dt), 0.095))
+
+    assert len(store._observations) == 1
+    obs = store._observations[0]
+    # Horizon from interval START: (14:00 - 08:00) = 6.0h
+    assert abs(obs["horizon_hours"] - 6.0) < 0.01, (
+        f"Expected horizon 6.0h (using interval START), got {obs['horizon_hours']}h. "
+        f"If 6.5h, the store is incorrectly using nemtime (interval END)."
+    )
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
